@@ -335,19 +335,22 @@ core_entry:
     
     ; rbp = stack_top
     ; rsp = stack_top
-    ; rax = core_address
-    ; rcx = core_buffer
+    ; r8 = core_main
+    ; r9 = core_buffer
     lea rbp, [r13 + STACK_SIZE - 16]
     lea rsp, [r13 + STACK_SIZE - 16]
-    lea rax, [r13 + STACK_SIZE     ]
-    mov rcx, r13
+    lea r8 , [r13 + STACK_SIZE     ]
+    mov r9 ,  r13
 
+    ; register suicide
+    xor rax, rax
     xor rbx, rbx
+    xor rcx, rcx
     xor rdx, rdx
     xor rsi, rsi
     xor rdi, rdi
-    xor r8 , r8
-    xor r9 , r9
+
+    ; r8 and r9 are input params, should be preserved
     xor r10, r10
     xor r11, r11
     xor r12, r12
@@ -365,11 +368,15 @@ core_entry:
     xorps xmm7, xmm7
 
     ; jump to core_main
-    jmp rax
+    jmp r8
+
+;
 
 ; r15 error_code
 critical_fail:
     mov [abs INVALID_ADDRESS], r15
+
+;
 
 ; =======================================================
 ;   STAGE 1:
@@ -377,533 +384,228 @@ critical_fail:
 ; Stack is available, memory is valid, layout is:
 ; [STACK, CODE, DATA]
 
+; Calling conventions
+; r8-r15 good integer params (no useful instructions use these registers implicitly)
+; all params can be in/inout/out
+; there is no such thing as return value, use inout/out instead
+; #no_return - never returns
+; #no_stack  - doesnt use stack except for call-ret rbp storage
+
+; #no_return
+; in: r8 = core_main_address
+; in: r9 = core_buffer_address
 align 16
 core_main:
+    ; stack:
+    ;   qword [rbp - 8 ] : core_address
+    ;   qword [rbp - 16] : core_data
+
     push rbp
-    mov rbp, rsp
-    sub rsp, 56
-
-    ; rax        = core_data
-    ; [rbp - 16] = core_buffer
-    ; [rbp - 24] = core_data
-    ; [rbp - 32] = memory_list
-    lea rax, [rcx + STACK_SIZE + CODE_SIZE]
-    mov [rbp - 16], rcx
-    mov [rbp - 24], rax
-    mov [rbp - 32], qword INVALID_ADDRESS
-
-    ; rcx = core_data
-    ; edx = color
-    mov rcx, [rbp - 24]
-    mov edx, 0x00000000
-    call clear_screen
-
-    mov rcx, [rbp - 24]
-    mov rdx, [rbp - 16]
-    call init_memory
-
-    ; [rbp - 32] = memory_list
-    mov [rbp - 32], rax
-
-    cmp rax, INVALID_ADDRESS
-    je .f_you
-
-    mov rcx, [rbp - 32]
-    call alloc_physical
-    cmp rax, INVALID_ADDRESS
-    je .f_you
-
-    ; [rbp - 32] = memory_list
-    mov [rbp - 32], rcx
-
-    mov rcx, [rbp - 32]
-    mov rdx, rax
-    call free_physical
-
-    mov rcx, [rbp - 24]
-    mov rdx, rax
-    mov r8 , 600
-    call print_memory_list
-
-    ; mov rcx, [rbp - 24]
-    ; lea rdx, [rel welcome_message]
-    ; call print_str
-
-    .loop:
-        nop
-        jmp .loop
-
-    .f_you:
-        mov rcx, [rbp - 24]
-        lea rdx, [rel .shitty_message]
-        call print_str
-        jmp .loop
-
-    .shitty_message:
-        db "good luck, you are fucked",0
-
-; =======================================================
-;   MEMORY ALLOCATOR
-; =======================================================
-
-; rcx = core_data
-; rdx = core_base_address
-; rax = pages_list (return)
-init_memory:
-    lea rax, [rcx + core_data_t_size            ]
-    mov rbx, [rcx + core_data_t.descriptor_count]
-    shl rbx, 5
-    add rbx, rax
-
-    ; rcx = core_base
-    ; rdx = core_limit
-    mov rcx, rdx
-    add rdx, CORE_SIZE
-
-    .descriptor_loop:
-        cmp rax, rbx
-        je .descriptor_loop_end
-
-        ; r8  = memory_type
-        ; r9  = memory_page_count
-        ; r10 = memory_attributes
-        ; r11 = memory_address
-        mov r8,  [rax + memory_descriptor_t.type      ] 
-        mov r9,  [rax + memory_descriptor_t.size      ]
-        mov r10, [rax + memory_descriptor_t.attributes]
-        mov r11, [rax + memory_descriptor_t.address   ]
-
-        cmp r8, MEMORY_TYPE_CONVENTIONAL_MEMORY
-        je .descriptor_loop_attributes
-        cmp r8, MEMORY_TYPE_BOOT_SERVICES_CODE
-        je .descriptor_loop_attributes
-        cmp r8, MEMORY_TYPE_LOADER_CODE
-        je .descriptor_loop_attributes
-        cmp r8, MEMORY_TYPE_LOADER_DATA
-        je .descriptor_loop_attributes
-        jmp .descriptor_loop_skip
-
-        .descriptor_loop_attributes:
-        ; r12 = unsuitable_attributes
-        mov  r12, MEMORY_ATTRIBUTE_UNSUITABLE_MASK
-        test r12, r10
-        jnz .descriptor_loop_skip
-
-        ; r12  = previous_page_ptr
-        ; r9   = page_count
-        ; rsi  = page_mem_i
-        ; xmm0 = 0
-        mov   r12, INVALID_ADDRESS
-        mov   rsi, r11
-        xorps xmm0, xmm0
-        .page_loop:
-            test r9, r9
-            jz .page_loop_end
-
-            ; check core intersection
-            cmp rsi, rcx
-            jb .fill_page
-            cmp rsi, rdx
-            jae .fill_page
-
-            add rsi, 4096
-            dec r9
-            jmp .page_loop
-
-            .fill_page:
-            mov [rsi + 0], r12
-            mov [rsi + 8], qword 0
-            mov r12, rsi
-
-            ; rsi = page_mem_i
-            ; rdi = page_mem_end
-            lea rdi, [rsi + 4096]
-            add rsi, 16
-            
-            .zero_loop:
-                cmp rsi, rdi
-                je .zero_loop_end
-
-                movdqa [rsi], xmm0
-
-                add rsi, 16
-                jmp .zero_loop
-            .zero_loop_end:
-
-            dec r9
-            jmp .page_loop
-        .page_loop_end:
-
-        .descriptor_loop_skip:
-        add rax, 32
-        jmp .descriptor_loop
-    .descriptor_loop_end:
-
-    mov rax, r12
-    ret
-
-; rcx = core_data
-; rdx = memory_list
-; r8  = stack_buffer_size (16 bytes aligned)
-print_memory_list:
-    push rbp
-    mov rbp, rsp
-    sub rsp, r8
-    sub rsp, 8
-
-    ; rax = str_begin
-    ; rbx = str_end
-    ; rcx = str_i
-    ; rsi = memory_list
-    ; r15 = core_data
-    lea rax, [rsp + 8 ]
-    lea rbx, [rbp - 24]
-    mov rsi, rdx
-    mov r15, rcx    
-    mov rcx, rax    
-
-
-    .loop: 
-        cmp rsi, INVALID_ADDRESS
-        je .loop_end
-        cmp rcx, rbx
-        jae .loop_end
-
-        
-        mov rdx, rsi
-        call qw_to_str         
-        mov [rcx + 0], byte 13
-        mov [rcx + 1], byte 0
-        inc rcx
-
-        mov rsi, [rsi]
-        jmp .loop
-    .loop_end:
-    
-    mov rcx, r15
-    mov rdx, rax
-    call print_str
-    
-    mov rsp, rbp
-    pop rbp
-    ret
-
-; inout rcx = memory_list
-; out   rax = allocated_page
-alloc_physical:
-    mov rax, rcx
-    cmp rcx, INVALID_ADDRESS
-    je .fail
-    test rcx, 0x0000000000000FFF
-    jnz .fail
-
-    mov rcx, [rax]
-    mov [rax + 0], qword 0
-    mov [rax + 8], qword 0
-    ret
-
-    .fail:
-    mov rax, INVALID_ADDRESS
-    ret
-
-; inout rcx = memory_list
-; in    rdx = page
-; r8, rdx
-free_physical:
-    test rdx, 0x0000000000000FFF
-    jnz .fail
-
-    ; [page + 0] = previous_page
-    ; [page + 8] = qw_0
-    ; rcx        = page (new memory_list)
-    mov [rdx + 0], rcx
-    mov [rdx + 8], qword 0
-    mov rcx, rdx
-
-    ; rdx  = page_i (after [page + 0] and [page + 8] qwords)
-    ; r8   = page_end
-    ; xmm0 = oct_0
-    lea r8 , [rdx + 4096]
-    add rdx, 16
-    xorps xmm0, xmm0
-    .zero_loop:
-        cmp rdx, r8
-        je .zero_loop_end
-
-        movdqa [rdx], xmm0
-        
-        add rdx, 16
-        jmp .zero_loop
-    .zero_loop_end:
-
-    .fail:
-    ret
-
-; =======================================================
-;   STRING OUTPUT
-; ======================================================= 
-
-; rcx = core_data
-; edx = color
-; rax, rbx
-clear_screen:
-    mov rax, [rcx + core_data_t.frame_buffer]
-    mov rbx, [rcx + core_data_t.frame_size  ]
-    add rbx, rax
-
-    .fill_loop:
-        cmp rax, rbx
-        je .fill_loop_end
-
-        mov [rax], edx
-
-        add rax, 4
-        jmp .fill_loop
-    .fill_loop_end:
-    ret
-
-; rcx = core_data
-; rax, rbx, rcx, rdx, rsi, rdi, r8-r14
-print_abc:
-    ; rax = frame_buffer
-    ; rbx = frame_line_size (in bytes)
-    ; rcx = resolution_x
-    ; rdx = resolution_y
-    mov rax, [rcx + core_data_t.frame_buffer]
-    mov rbx, [rcx + core_data_t.frame_line  ]
-    mov rdx, [rcx + core_data_t.frame_y     ]
-    mov rcx, [rcx + core_data_t.frame_x     ]
-    shl rbx, 2
-
-    ; rsi = characters_i
-    ; rdi = characters_end
-    lea rsi, [rel characters ]
-    lea rdi, [rsi + 0x60 * 32]
-
-    ; r8   = x--
-    ; r9   = y--
-    ; r10  = character
-    ; r11  = bit
-    ; r12d = off_color
-    ; r13d = on_color
-    mov r9  , rdx
-    mov r13d, 0x0000FF11
-    .loop_y:
-        cmp r9, 16
-        jb .loop_y_end
-
-        ; r8 = x--
-        mov r8, rcx 
-        .loop_x:
-            cmp r8, 16
-            jb .loop_x_end
-
-            cmp rsi, rdi
-            je .loop_y_end
-
-            %rep 4
-                mov r10, [rsi]
-                mov r11, 0x8000000000000000
-
-                %rep 4
-                    %rep 16
-                        mov r12d, [rax]
-                        test r10, r11
-                        cmovnz r12d, r13d
-                        mov [rax], r12d
-                        shr r11, 1
-                        add rax, 4
-                    %endrep
-                    
-                    add rax, rbx
-                    sub rax, 64
-                %endrep
-
-                add rsi, 8
-            %endrep
-
-            mov r14, rbx
-            shl r14, 4
-            sub rax, r14
-            add rax, 64
-
-            sub r8, 16
-            jmp .loop_x
-        .loop_x_end:
-
-        mov r14, rbx
-        shl r14, 4
-        sub r14, rbx
-        shl r8 , 2
-        add r14, r8
-        add rax, r14
-
-        sub r9, 16
-        jmp .loop_y
-    .loop_y_end:
-
-    ret
-
-; rcx = dst
-; rdx = src
-; r8
-str_to_str:
-    .cpy_loop:
-        mov r8b, [rdx]
-        mov [rcx], r8b
-
-        test r8b, r8b
-        jz .cpy_loop_end
-
-        inc rcx
-        inc rdx
-        jmp .cpy_loop
-    .cpy_loop_end:
-    ret
-
-; rcx = dst
-; rdx = qw
-; r8, r9
-qw_to_str:
-    add rcx, 15 
-
-    %rep 16
-        mov r8, rdx
-        and r8, 0xF
-        lea r9, [r8 + 'A' - 10]
-        add r8, '0'
-        cmp r8, '9'
-        cmova r8, r9
-
-        mov [rcx], r8b
-
-        shr rdx, 4
-        dec rcx
-    %endrep
-
-    ; 16 + 1 extra shift in the end
-    add rcx, 17
-    mov [rcx], byte 0
-    ret
-
-; rcx = core_data
-; rdx = string
-print_str:
-    ; rax = frame_buffer_i
-    ; rbx = frame_line_size
-    ; rsi = resolution_x - 16
-    ; rdi = resolution_y - 16
-    mov rax, [rcx + core_data_t.frame_buffer]
-    mov rbx, [rcx + core_data_t.frame_line  ]
-    mov rsi, [rcx + core_data_t.frame_x     ]
-    mov rdi, [rcx + core_data_t.frame_y     ]
-    sub rsi, 16
-    sub rdi, 16
-    shl rbx, 2
-
-    ; r15 = character_masks
-    ; r8  = x
-    ; r9  = y
-    lea r15, [rel characters]
-    xor r8, r8
+    mov  rsp, rbp
+    sub  rsp, 24
+
+    ; qword [rbp - 8 ] = core_address 
+    ; qword [rbp - 16] = core_data
+    lea r8, [r9 + STACK_SIZE + CODE_SIZE]
+    mov qword [rbp - 8 ], r9
+    mov qword [rbp - 16], r8
+
+    ;mov [abs INVALID_ADDRESS], rax
+
+    ; r8 = core_data
+    ; r9 = balck
+    mov r8, qword [rbp - 16]
     xor r9, r9
+    call screen_out_clear
 
-    .str_loop:
-        ; r10 = char_code
-        xor r10 , r10
-        mov r10b, [rdx]
-        inc rdx
+    ; r8  = core_data
+    ; r9  = green
+    ; r10 = .hello_message_begin
+    ; r11 = .hello_message_end
+    mov r8 , qword [rbp - 16]
+    mov r9 , 0x0000FF00
+    lea r10, [rel .abc    ]
+    lea r11, [rel .abc_end]
+    call screen_out_print_ascii
 
-        ; r10 == \0
-        test r10, r10
-        jz .str_loop_end
-        ; r10 == \n
-        cmp r10, 13 
-        je .move_down
+    hlt
 
-        ; if invalid ascii print ' '
-        ; r11 = 0
-        ; r10 = char_mask_i
-        xor r11, r11
-        sub r10, 0x20
-        cmovc r10, r11
-        cmp r10, 0x7F - 0x20
-        cmova r10, r11
-        shl r10, 5
+    .abc:
+        db 0x01,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F
+        db 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F
+        db 0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2A,0x2B,0x2C,0x2D,0x2E,0x2F
+        db 0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F
+        db 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4A,0x4B,0x4C,0x4D,0x4E,0x4F
+        db 0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5A,0x5B,0x5C,0x5D,0x5E,0x5F
+        db 0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6A,0x6B,0x6C,0x6D,0x6E,0x6F
+        db 0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7A,0x7B,0x7C,0x7D,0x7E,0x7F
+    .abc_end:
+;
 
-        .render_glyph:
-            ; rcx = pixel_i
-            mov rcx, rax
-            ; for each qword
-            %rep 4
-                ; r11 = char_mask
-                ; r12 = bit_mask
-                mov r11, [r15 + r10]
-                mov r12, 0x8000000000000000
-                add r10, 8
+; === SCREEN_OUT ===
+; screen_out_clear
+; 
 
-                ; for each row
-                %rep 4
-                    ; for each pixel
-                    %rep 16
-                        mov r13d, 0x00000000
-                        mov r14d, 0x0000FF00
+; #no_stack
+; in: r8 = core_data
+; in: r9 = clear_color
+; use: rax, rbx
+; estimation is frame buffer consists of 4-byte pixels
+screen_out_clear:
+    ; rax = frame_buffer_i
+    ; rbx = frame_buffer_end
+    mov rax, qword [r8 + core_data_t.frame_buffer]
+    mov rbx, qword [r8 + core_data_t.frame_size  ]
+    add rbx, rax
 
-                        test r11, r12
-                        cmovnz r13d, r14d
-                        mov [rcx], r13d
-                        shr r12, 1
-                        add rcx, 4
-                    %endrep
+    cmp rax, rbx
+    je .end
+    .fill_loop:
+        mov dword [rax], r9d
+        add rax, 4
+        cmp rax, rbx
+        jne .fill_loop
 
-                    add rcx, rbx
-                    sub rcx, 64
-                %endrep
-            %endrep
-        .render_glyph_end:
-
-        .move_next:
-        add r8, 16
-        cmp r8, rsi
-        jb .move_right
-
-        add r9, 16
-        cmp r9, rdi
-        jae .str_loop_end
-        
-        sub r8, 16
-        .move_down:
-        xor r10, r10
-        mov r11, r8
-        shl r11, 2
-        lea r10, [r10 + rbx * 8]
-        lea r10, [r10 + rbx * 8]
-        ; sub r10 rbx for no space in between lines
-        add r10, rbx ; 2 pixel spacing between lines
-        sub r10, r11
-
-        add rax, r10
-        xor r8, r8
-        jmp .str_loop
-
-        .move_right:
-        add rax, 64
-        jmp .str_loop
-
-    .str_loop_end:
+    .end:
     ret
+;
 
-welcome_message:
-    db "hello! welcome to the ROCK BOTTOM", 13
-    db "here is the manual:{", 13
-    db "   f@$k you!", 13
-    db "       f#%k you!", 13
-    db "           f&*k you!", 13
-    db "}", 0
-    
-align 16
+; #no_stack
+; in: r8  = core_data
+; in: r9  = glyph_color
+; in: r10 = ascii_str
+; in: r11 = ascii_str_end
+; glyphs are 16x16 pixel size
+; all invalid symbols replaced with del
+; supported special symbols are 0-termination and 13-next_line
+screen_out_print_ascii:
+    ; rax = frame_buffer_i
+    ; rbx = resolution_x - 16
+    ; rcx = resolution_y - 16
+    ; rdx = scanline_size
+    mov rax, qword [r8 + core_data_t.frame_buffer]
+    mov rbx, qword [r8 + core_data_t.frame_x     ]
+    mov rcx, qword [r8 + core_data_t.frame_y     ]
+    mov rdx, qword [r8 + core_data_t.frame_line  ]
+    sub rbx, 16
+    sub rcx, 16
+    shl rdx, 2
+
+    ; r10 = str_i
+    ; r11 = str_end
+    ; rsi = pixel_x
+    ; rdi = pixel_y
+    ; r12 : bit_mask
+    ; r13 : char_mask
+    ; r14 : dst_color    | del
+    ; r15 : char_qword_i | scan_line_shift
+    xor rsi, rsi
+    xor rdi, rdi
+    ; check if string is not zero len
+    cmp r10, r11
+    jae .end
+    ; check if we can at least print 1 row of glyphs
+    cmp rsi, rbx
+    ja .end
+    cmp rdi, rcx
+    ja .end
+    ; print string
+    .str_loop:
+        cmp r10, r11
+        je .str_loop_end
+
+        ; if pixel_x > resolution_x - 16 goto next row
+        cmp rsi, rbx
+        ja .next_row
+        
+        ; r14 = del
+        ; r15 = char_qword_i
+        xor r15, r15
+        mov r14, 0x7F
+        mov r15b, byte [r10]
+        ; special codes
+        test r15b, r15b
+        jz .end
+        cmp r15b, 13
+        je .next_row_symbol
+
+        ; ascii glyphs
+        cmp r15b, 0x20
+        cmovb r15, r14
+        cmp r15b, 0x7F
+        cmova r15, r14
+        sub r15, 0x20
+        shl r15, 5
+
+        ; for each qword of glyph
+        %rep 4
+            ; r13 = char_mask
+            ; r12 = bit_mask
+            ; r15 = char_qword_i
+            lea r13, [rel characters]
+            mov r13, qword [r13 + r15]
+            mov r12, 0x8000000000000000
+
+            ; for each row of qword
+            %rep 4
+                ; for each pixel in line
+                %rep 16
+                    ; dst_color = bit set ? glyph_color : background_color
+                    mov r14d, dword [rax]
+                    test r12, r13
+                    cmovnz r14d, r9d
+                    mov dword [rax], r14d
+
+                    ; bit_mask       = bit_mask >> 1
+                    ; frame_buffer_i = frame_buffer_i + 4
+                    add rax, 4
+                    shr r12, 1
+                %endrep
+
+                sub rax, 16 * 4
+                add rax, rdx
+            %endrep
+            ; char_qword_i = char_qword_i + 8
+            add r15, 8
+        %endrep
+
+        ; r15            = scan_line_shift = scanline_size * 16
+        ; frame_buffer_i = frame_buffer_i - scan_line_shift + 16 * 4
+        ; pixel_x        = pixel_x + 16
+        ; str_i          = str_i + 1
+        mov r15, rdx
+        shl r15, 4
+        sub rax, r15
+        add rax, 16 * 4
+        add rsi, 16
+        inc r10
+        jmp .str_loop
+
+        .next_row_symbol:
+        inc r10
+        .next_row:
+        ; frame_buffer_i = frame_buffer_i + scanline_size * 16 - pixel_x * 4
+        ; pixel_x = 0
+        ; pixel_y = pixel_y + 17
+        lea rax, [rax + rdx * 8]
+        lea rax, [rax + rdx * 8]
+        shl rsi, 2
+        sub rax, rsi
+        xor rsi, rsi
+        add rdi, 17
+        ; check y boundary
+        cmp rdi, rcx
+        jbe .str_loop
+    .str_loop_end:
+
+    .end:
+    ret
+;
+
 ; code E [0x20; 0x7F]
+; FIX FUCKING p lowercase,
 ; 16x16 grid requires 256 bits (32 bytes) per glyph.
+align 16
 characters:
     dq 0x0000000000000000
     dq 0x0000000000000000
@@ -1305,13 +1007,13 @@ characters:
     dq 0x1818181818181818
     dq 0x181807E007E00000
 
-    dq 0x0000000000001FE0
-    dq 0x1FE0181818181818
+    dq 0x00000000000019E0
+    dq 0x19E01E181E181818
     dq 0x18181FE01FE01800
     dq 0x1800180018000000
 
-    dq 0x00000000000007F8
-    dq 0x07F8181818181818
+    dq 0x0000000000000798
+    dq 0x0798187818781818
     dq 0x181807F807F80018
     dq 0x0018001800180000
 
@@ -1384,6 +1086,8 @@ characters:
     dq 0x18181C38166813C8
     dq 0x13C816681C381818
     dq 0x1FF81FF800000000
+
+;
 
 align 16
 core_end:
